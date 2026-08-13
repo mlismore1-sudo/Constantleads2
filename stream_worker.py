@@ -1,14 +1,13 @@
 import json
 import os
-import sqlite3
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 
+import psycopg
 import requests
+from psycopg.rows import dict_row
 
 STREAM_URL = "https://stream.companieshouse.gov.uk/companies"
-DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "screened_companies.db"))
 TARGET_SIC_CODES = {
     "62012",
     "63110",
@@ -20,70 +19,57 @@ TARGET_SIC_CODES = {
 
 
 def get_connection():
-    connection = sqlite3.connect(DATABASE_PATH, timeout=30)
-    connection.row_factory = sqlite3.Row
-    return connection
+    return psycopg.connect(
+        os.environ["DATABASE_URL"],
+        row_factory=dict_row,
+        connect_timeout=30,
+        sslmode="require",
+    )
 
 
-def initialise_database():
-    with get_connection() as connection:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS screened_companies (
-                company_number TEXT PRIMARY KEY,
-                company_name TEXT NOT NULL,
-                incorporation_date TEXT,
-                company_status TEXT,
-                sic_codes TEXT,
-                company_url TEXT NOT NULL,
-                screened_at TEXT NOT NULL,
-                shortlisted INTEGER NOT NULL DEFAULT 0,
-                published_at TEXT
-            )
-            """
-        )
-
-        columns = {
-            row[1]
-            for row in connection.execute(
-                "PRAGMA table_info(screened_companies)"
-            ).fetchall()
-        }
-
-        if "shortlisted" not in columns:
-            connection.execute(
-                "ALTER TABLE screened_companies "
-                "ADD COLUMN shortlisted INTEGER NOT NULL DEFAULT 0"
-            )
-
-        if "published_at" not in columns:
-            connection.execute(
-                "ALTER TABLE screened_companies ADD COLUMN published_at TEXT"
-            )
-
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS stream_state (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                timepoint INTEGER
-            )
-            """
-        )
-        connection.commit()
+def get_timepoint(connection):
+    row = connection.execute(
+        "SELECT timepoint FROM stream_state WHERE id = 1"
+    ).fetchone()
+    return row["timepoint"] if row else None
 
 
-def get_timepoint():
-    with get_connection() as connection:
-        row = connection.execute(
-            "SELECT timepoint FROM stream_state WHERE id = 1"
-        ).fetchone()
-    return row["timepoint"] if row and row["timepoint"] else None
+def extract_event_metadata(event):
+    event_metadata = event.get("event") or {}
+    timepoint = event_metadata.get("timepoint", event.get("timepoint"))
+    published_at = event_metadata.get(
+        "published_at",
+        event.get("published_at"),
+    )
+    return event_metadata, timepoint, published_at
 
 
-def save_event(company, event):
+def save_timepoint(connection, timepoint):
+    if timepoint is None:
+        return
+
+    connection.execute(
+        """
+        INSERT INTO stream_state (id, timepoint, updated_at)
+        VALUES (1, %s, NOW())
+        ON CONFLICT (id) DO UPDATE SET
+            timepoint = EXCLUDED.timepoint,
+            updated_at = NOW()
+        """,
+        (int(timepoint),),
+    )
+
+
+def save_matching_company(
+    connection,
+    company,
+    published_at,
+    received_at,
+):
     company_number = company.get("company_number")
     sic_codes = set(company.get("sic_codes") or [])
     incorporation_date = company.get("date_of_creation")
+    stream_start_date = os.getenv("STREAM_START_DATE", "")
 
     if not company_number:
         return False
@@ -91,99 +77,77 @@ def save_event(company, event):
     if not sic_codes.intersection(TARGET_SIC_CODES):
         return False
 
-    stream_start_date = os.getenv("STREAM_START_DATE", "")
     if stream_start_date and (
         not incorporation_date or incorporation_date < stream_start_date
     ):
         return False
 
-    now = datetime.now(timezone.utc).isoformat()
-    company_name = company.get("company_name") or "Unnamed company"
-    published_at = event.get("published_at")
     company_url = (
         "https://find-and-update.company-information.service.gov.uk/company/"
         f"{company_number}"
     )
-
-    with get_connection() as connection:
-        connection.execute(
-            """
-            INSERT INTO screened_companies (
-                company_number,
-                company_name,
-                incorporation_date,
-                company_status,
-                sic_codes,
-                company_url,
-                screened_at,
-                shortlisted,
-                published_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
-            ON CONFLICT(company_number) DO UPDATE SET
-                company_name = excluded.company_name,
-                incorporation_date = excluded.incorporation_date,
-                company_status = excluded.company_status,
-                sic_codes = excluded.sic_codes,
-                company_url = excluded.company_url,
-                published_at = COALESCE(
-                    excluded.published_at,
-                    screened_companies.published_at
-                )
-            """,
-            (
-                company_number,
-                company_name,
-                incorporation_date or "",
-                company.get("company_status", ""),
-                ", ".join(sorted(sic_codes)),
-                company_url,
-                now,
-                published_at,
-            ),
-        )
-
-        if event.get("timepoint") is not None:
-            connection.execute(
-                """
-                INSERT INTO stream_state (id, timepoint)
-                VALUES (1, ?)
-                ON CONFLICT(id) DO UPDATE SET timepoint = excluded.timepoint
-                """,
-                (int(event["timepoint"]),),
-            )
-
-
-    return True
-
-def save_timepoint(connection, event):
-    timepoint = event.get("timepoint")
-
-    if timepoint is None:
-        return
+    company_name = company.get("company_name") or "Unnamed company"
 
     connection.execute(
         """
-        INSERT INTO stream_state (id, timepoint)
-        VALUES (1, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            timepoint = excluded.timepoint
+        INSERT INTO screened_companies (
+            company_number,
+            company_name,
+            incorporation_date,
+            company_status,
+            sic_codes,
+            company_url,
+            screened_at,
+            shortlisted,
+            published_at,
+            received_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE, %s, %s)
+        ON CONFLICT (company_number) DO UPDATE SET
+            company_name = EXCLUDED.company_name,
+            incorporation_date = EXCLUDED.incorporation_date,
+            company_status = EXCLUDED.company_status,
+            sic_codes = EXCLUDED.sic_codes,
+            company_url = EXCLUDED.company_url,
+            published_at = COALESCE(
+                EXCLUDED.published_at,
+                screened_companies.published_at
+            ),
+            received_at = EXCLUDED.received_at
         """,
-        (int(timepoint),),
+        (
+            company_number,
+            company_name,
+            incorporation_date,
+            company.get("company_status", ""),
+            ", ".join(sorted(sic_codes)),
+            company_url,
+            received_at,
+            published_at,
+            received_at,
+        ),
     )
+
+    return True
+
+
 def run_worker(api_key):
-    initialise_database()
     reconnect_delay = 5
+    session = requests.Session()
+    session.auth = (api_key, "")
+    session.headers.update({"Accept": "application/json"})
 
     while True:
-        timepoint = get_timepoint()
-        params = {"timepoint": timepoint} if timepoint else {}
+        connection = None
 
         try:
-            with requests.get(
+            connection = get_connection()
+            timepoint = get_timepoint(connection)
+            params = {"timepoint": timepoint} if timepoint else {}
+
+            with session.get(
                 STREAM_URL,
                 params=params,
-                auth=(api_key, ""),
                 stream=True,
                 timeout=(30, 300),
             ) as response:
@@ -194,31 +158,44 @@ def run_worker(api_key):
                     if not raw_line:
                         continue
 
-                   event = json.loads(raw_line)
+                    received_at = datetime.now(timezone.utc)
+                    event = json.loads(raw_line)
+                    company = event.get("data") or {}
+                    _, timepoint, published_at = extract_event_metadata(event)
 
-company = event.get("data") or {}
-event_data = event.get("event") or {}
+                    save_matching_company(
+                        connection,
+                        company,
+                        published_at,
+                        received_at,
+                    )
 
-save_timepoint(connection, event_data)
-save_event(connection, company, event_data)
+                    # Checkpoint every event, including non-matching events.
+                    # This prevents a restart from replaying an old backlog.
+                    save_timepoint(connection, timepoint)
+                    connection.commit()
 
-connection.commit()
         except (
             requests.RequestException,
             json.JSONDecodeError,
+            psycopg.Error,
             OSError,
         ) as error:
             print(
                 f"Stream disconnected: {error}. "
-                f"Reconnecting in {reconnect_delay}s.",
+                f"Reconnecting in {reconnect_delay} seconds.",
                 flush=True,
             )
             time.sleep(reconnect_delay)
             reconnect_delay = min(reconnect_delay * 2, 300)
 
+        finally:
+            if connection is not None:
+                connection.close()
+
 
 if __name__ == "__main__":
-    streaming_api_key = os.getenv("COMPANIES_HOUSE_STREAMING_API_KEY")
+    streaming_api_key = os.environ.get("COMPANIES_HOUSE_STREAMING_API_KEY")
 
     if not streaming_api_key:
         raise RuntimeError(
