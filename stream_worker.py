@@ -153,11 +153,24 @@ def save_event(company, event):
                 (int(event["timepoint"]),),
             )
 
-        connection.commit()
 
     return True
 
+def save_timepoint(connection, event):
+    timepoint = event.get("timepoint")
 
+    if timepoint is None:
+        return
+
+    connection.execute(
+        """
+        INSERT INTO stream_state (id, timepoint)
+        VALUES (1, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            timepoint = excluded.timepoint
+        """,
+        (int(timepoint),),
+    )
 def run_worker(api_key):
     initialise_database()
     reconnect_delay = 5
@@ -181,11 +194,15 @@ def run_worker(api_key):
                     if not raw_line:
                         continue
 
-                    event = json.loads(raw_line)
-                    event_data = event.get("event") or {}
-                    company = event.get("data") or {}
-                    save_event(company, event_data)
+                   event = json.loads(raw_line)
 
+company = event.get("data") or {}
+event_data = event.get("event") or {}
+
+save_timepoint(connection, event_data)
+save_event(connection, company, event_data)
+
+connection.commit()
         except (
             requests.RequestException,
             json.JSONDecodeError,
