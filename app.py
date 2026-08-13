@@ -12,7 +12,7 @@ import streamlit as st
 from psycopg.rows import dict_row
 from streamlit_autorefresh import st_autorefresh
 
-APP_VERSION = "2026-08-13-single-streamlit-app"
+APP_VERSION = "2026-08-13-single-streamlit-app-health-check"
 STREAM_URL = "https://stream.companieshouse.gov.uk/companies"
 DISPLAY_LIMIT = 250
 REFRESH_INTERVAL_MS = 1000
@@ -33,6 +33,30 @@ def get_connection(database_url):
         connect_timeout=30,
         sslmode="require",
     )
+
+
+def check_database_connection(database_url):
+    try:
+        with get_connection(database_url) as connection:
+            database = connection.execute(
+                "SELECT current_database() AS database_name, "
+                "current_schema() AS schema_name, NOW() AS database_time"
+            ).fetchone()
+            stream = connection.execute(
+                "SELECT timepoint, updated_at "
+                "FROM stream_state WHERE id = 1"
+            ).fetchone()
+        return True, database, stream, None
+    except Exception as error:
+        return False, None, None, f"{type(error).__name__}: {error}"
+
+
+def dataframe_from_query(connection, query, params=()):
+    with connection.cursor() as cursor:
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        columns = [column.name for column in cursor.description]
+    return pd.DataFrame(rows, columns=columns)
 
 
 def ensure_shortlist_column(dataframe):
@@ -200,7 +224,6 @@ def stream_worker(
                         test_all_sic_codes,
                     )
 
-                    # Checkpoint every event, including non-matching events.
                     save_timepoint(connection, event_timepoint)
                     connection.commit()
 
@@ -269,10 +292,10 @@ def get_history(database_url, start_date, end_date):
     )
 
     with get_connection(database_url) as connection:
-        history = pd.read_sql_query(
-            query,
+        history = dataframe_from_query(
             connection,
-            params=(
+            query,
+            (
                 start_date.isoformat(),
                 end_date.isoformat(),
                 DISPLAY_LIMIT,
@@ -346,10 +369,10 @@ def get_shortlist(database_url, start_date, end_date):
     )
 
     with get_connection(database_url) as connection:
-        return pd.read_sql_query(
-            query,
+        return dataframe_from_query(
             connection,
-            params=(start_date.isoformat(), end_date.isoformat()),
+            query,
+            (start_date.isoformat(), end_date.isoformat()),
         )
 
 
@@ -399,6 +422,29 @@ st.caption(f"Application version: {APP_VERSION}")
 st.caption(
     "The Companies House worker starts automatically inside Streamlit."
 )
+
+with st.sidebar:
+    st.subheader("System status")
+    database_ok, database_info, stream_info, database_error = (
+        check_database_connection(database_url)
+    )
+
+    if database_ok:
+        st.success("Database connected")
+        with st.expander("Database details"):
+            st.write(f"Database: {database_info['database_name']}")
+            st.write(f"Schema: {database_info['schema_name']}")
+            st.write(f"Database time: {database_info['database_time']}")
+
+        if stream_info:
+            st.success("Stream state found")
+            st.write(f"Last timepoint: {stream_info['timepoint']}")
+            st.write(f"Last stream update: {stream_info['updated_at']}")
+        else:
+            st.warning("No stream state recorded yet")
+    else:
+        st.error("Database disconnected")
+        st.code(database_error)
 
 col1, col2 = st.columns(2)
 start_date = col1.date_input("From incorporation date", value=date.today())
