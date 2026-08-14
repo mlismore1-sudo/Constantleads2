@@ -152,7 +152,7 @@ def stream_worker(database_url, api_key, start_date, test_all_sic_codes):
     session.headers.update({"Accept": "application/json"})
 
     print(
-        "Render worker starting. "
+        "Oracle worker starting. "
         f"SIC mode={'ALL' if test_all_sic_codes else 'REFINED'}. "
         f"Start date={start_date or 'not set'}",
         flush=True,
