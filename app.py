@@ -1,6 +1,10 @@
+import base64
+import io
 import json
+import math
 import threading
 import time
+import wave
 from datetime import date, datetime, timezone
 
 import pandas as pd
@@ -10,10 +14,10 @@ import streamlit as st
 from psycopg.rows import dict_row
 from streamlit_autorefresh import st_autorefresh
 
-APP_VERSION = "2026-08-13-stream-diagnostics"
+APP_VERSION = "2026-08-14-stream-diagnostics-sound"
 STREAM_URL = "https://stream.companieshouse.gov.uk/companies"
 DISPLAY_LIMIT = 250
-REFRESH_INTERVAL_MS = 1000
+REFRESH_INTERVAL_MS = 15000
 TARGET_SIC_CODES = {
     "62012", "63110", "64209", "64301", "64999", "72110"
 }
@@ -25,6 +29,49 @@ def get_connection(database_url):
         row_factory=dict_row,
         connect_timeout=30,
         sslmode="require",
+    )
+
+
+@st.cache_data
+def create_chime():
+    sample_rate = 44100
+    duration = 0.35
+    volume = 0.25
+    frequencies = (880, 1175)
+    frames = bytearray()
+
+    for index in range(int(sample_rate * duration)):
+        current_time = index / sample_rate
+        frequency = frequencies[0] if current_time < 0.16 else frequencies[1]
+        attack = min(1.0, index / 800)
+        release = max(0.0, 1.0 - max(0.0, current_time - 0.20) / 0.15)
+        envelope = attack * release
+        sample = int(
+            32767
+            * volume
+            * envelope
+            * math.sin(2 * math.pi * frequency * current_time)
+        )
+        frames.extend(sample.to_bytes(2, byteorder="little", signed=True))
+
+    audio_buffer = io.BytesIO()
+    with wave.open(audio_buffer, "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(sample_rate)
+        audio.writeframes(frames)
+    return audio_buffer.getvalue()
+
+
+def play_chime():
+    encoded_audio = base64.b64encode(create_chime()).decode("ascii")
+    st.markdown(
+        f"""
+        <audio autoplay>
+            <source src="data:audio/wav;base64,{encoded_audio}" type="audio/wav">
+        </audio>
+        """,
+        unsafe_allow_html=True,
     )
 
 
@@ -48,10 +95,8 @@ def ensure_worker_status_table(connection):
     connection.execute(
         "CREATE TABLE IF NOT EXISTS worker_status ("
         "id INTEGER PRIMARY KEY CHECK (id = 1), "
-        "status TEXT NOT NULL, "
-        "last_connected_at TIMESTAMPTZ, "
-        "last_event_at TIMESTAMPTZ, "
-        "last_error TEXT, "
+        "status TEXT NOT NULL, last_connected_at TIMESTAMPTZ, "
+        "last_event_at TIMESTAMPTZ, last_error TEXT, "
         "updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"
         ")"
     )
@@ -62,17 +107,14 @@ def update_worker_status(connection, status, error=None, event_received=False):
     connection.execute(
         "INSERT INTO worker_status ("
         "id, status, last_connected_at, last_event_at, last_error, updated_at"
-        ") VALUES ("
-        "1, %s, "
+        ") VALUES (1, %s, "
         "CASE WHEN %s = 'connected' THEN NOW() ELSE NULL END, "
-        "CASE WHEN %s THEN NOW() ELSE NULL END, %s, NOW()"
-        ") ON CONFLICT (id) DO UPDATE SET "
-        "status = EXCLUDED.status, "
-        "last_connected_at = CASE "
-        "WHEN EXCLUDED.status = 'connected' THEN NOW() "
-        "ELSE worker_status.last_connected_at END, "
-        "last_event_at = CASE "
-        "WHEN %s THEN NOW() ELSE worker_status.last_event_at END, "
+        "CASE WHEN %s THEN NOW() ELSE NULL END, %s, NOW()) "
+        "ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, "
+        "last_connected_at = CASE WHEN EXCLUDED.status = 'connected' "
+        "THEN NOW() ELSE worker_status.last_connected_at END, "
+        "last_event_at = CASE WHEN %s THEN NOW() "
+        "ELSE worker_status.last_event_at END, "
         "last_error = EXCLUDED.last_error, updated_at = NOW()",
         (status, status, event_received, error, event_received),
     )
@@ -94,7 +136,6 @@ def check_database_connection(database_url):
                 "SELECT current_database() AS database_name, "
                 "current_schema() AS schema_name, NOW() AS database_time"
             ).fetchone()
-
             stream_info = None
             worker_info = None
             if database_table_exists(connection, "stream_state"):
@@ -106,7 +147,6 @@ def check_database_connection(database_url):
                     "SELECT status, last_connected_at, last_event_at, "
                     "last_error, updated_at FROM worker_status WHERE id = 1"
                 ).fetchone()
-
         return True, database_info, stream_info, worker_info, None
     except Exception as error:
         return False, None, None, None, f"{type(error).__name__}: {error}"
@@ -132,8 +172,7 @@ def save_timepoint(connection, timepoint):
         return
     connection.execute(
         "INSERT INTO stream_state (id, timepoint, updated_at) "
-        "VALUES (1, %s, NOW()) "
-        "ON CONFLICT (id) DO UPDATE SET "
+        "VALUES (1, %s, NOW()) ON CONFLICT (id) DO UPDATE SET "
         "timepoint = EXCLUDED.timepoint, updated_at = NOW()",
         (int(timepoint),),
     )
@@ -159,27 +198,21 @@ def save_matching_company(
         f"{company_number}"
     )
     connection.execute(
-        "INSERT INTO screened_companies ("
-        "company_number, company_name, incorporation_date, company_status, "
-        "sic_codes, company_url, screened_at, shortlisted, published_at, received_at"
-        ") VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE, %s, %s) "
+        "INSERT INTO screened_companies (company_number, company_name, "
+        "incorporation_date, company_status, sic_codes, company_url, "
+        "screened_at, shortlisted, published_at, received_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE, %s, %s) "
         "ON CONFLICT (company_number) DO UPDATE SET "
         "company_name = EXCLUDED.company_name, "
         "incorporation_date = EXCLUDED.incorporation_date, "
-        "company_status = EXCLUDED.company_status, sic_codes = EXCLUDED.sic_codes, "
-        "company_url = EXCLUDED.company_url, "
+        "company_status = EXCLUDED.company_status, "
+        "sic_codes = EXCLUDED.sic_codes, company_url = EXCLUDED.company_url, "
         "published_at = COALESCE(EXCLUDED.published_at, screened_companies.published_at), "
         "received_at = EXCLUDED.received_at",
         (
-            company_number,
-            company_name,
-            incorporation_date,
-            company.get("company_status", ""),
-            ", ".join(sorted(sic_codes)),
-            company_url,
-            received_at,
-            published_at,
-            received_at,
+            company_number, company_name, incorporation_date,
+            company.get("company_status", ""), ", ".join(sorted(sic_codes)),
+            company_url, received_at, published_at, received_at,
         ),
     )
     return True
@@ -190,7 +223,6 @@ def stream_worker(database_url, api_key, start_date, test_all_sic_codes):
     session = requests.Session()
     session.auth = (api_key, "")
     session.headers.update({"Accept": "application/json"})
-
     print(
         "Background worker starting. "
         f"SIC mode={'ALL' if test_all_sic_codes else 'REFINED'}. "
@@ -206,8 +238,8 @@ def stream_worker(database_url, api_key, start_date, test_all_sic_codes):
             update_worker_status(connection, "connecting")
             timepoint = get_timepoint(connection)
             params = {"timepoint": timepoint} if timepoint else {}
-
             print(f"Connecting to stream from timepoint={timepoint}", flush=True)
+
             with session.get(
                 STREAM_URL, params=params, stream=True, timeout=(30, 300)
             ) as response:
@@ -224,12 +256,8 @@ def stream_worker(database_url, api_key, start_date, test_all_sic_codes):
                     company = event.get("data") or {}
                     event_timepoint, published_at = extract_metadata(event)
                     matched = save_matching_company(
-                        connection,
-                        company,
-                        published_at,
-                        received_at,
-                        start_date,
-                        test_all_sic_codes,
+                        connection, company, published_at, received_at,
+                        start_date, test_all_sic_codes,
                     )
                     save_timepoint(connection, event_timepoint)
                     connection.commit()
@@ -246,9 +274,7 @@ def stream_worker(database_url, api_key, start_date, test_all_sic_codes):
         except (requests.RequestException, json.JSONDecodeError, psycopg.Error, OSError) as error:
             if connection is not None:
                 try:
-                    update_worker_status(
-                        connection, "reconnecting", error=str(error)
-                    )
+                    update_worker_status(connection, "reconnecting", error=str(error))
                 except psycopg.Error:
                     pass
             print(
@@ -281,21 +307,17 @@ def start_worker_once(database_url, api_key, start_date, test_all_sic_codes):
 
 def get_history(database_url, start_date, end_date):
     query = (
-        "SELECT company_name AS \"Company name\", "
-        "company_number AS \"Company number\", "
-        "incorporation_date AS \"Incorporation date\", "
-        "company_status AS \"Status\", sic_codes AS \"SIC codes\", "
-        "company_url AS \"Companies House page\", "
-        "received_at AS \"Received by worker\", "
-        "published_at AS \"Published by Companies House\", "
+        "SELECT company_name AS \"Company name\", company_number AS \"Company number\", "
+        "incorporation_date AS \"Incorporation date\", company_status AS \"Status\", "
+        "sic_codes AS \"SIC codes\", company_url AS \"Companies House page\", "
+        "received_at AS \"Received by worker\", published_at AS \"Published by Companies House\", "
         "shortlisted AS \"Shortlist\" FROM screened_companies "
         "WHERE incorporation_date >= %s AND incorporation_date <= %s "
         "ORDER BY received_at DESC, company_name ASC LIMIT %s"
     )
     with get_connection(database_url) as connection:
         history = dataframe_from_query(
-            connection,
-            query,
+            connection, query,
             (start_date.isoformat(), end_date.isoformat(), DISPLAY_LIMIT),
         )
     return ensure_shortlist_column(history)
@@ -304,27 +326,20 @@ def get_history(database_url, start_date, end_date):
 def get_counts(database_url, start_date, end_date):
     with get_connection(database_url) as connection:
         counts = connection.execute(
-            "SELECT COUNT(*) AS total, "
-            "COUNT(*) FILTER (WHERE shortlisted = TRUE) AS shortlisted "
-            "FROM screened_companies "
-            "WHERE incorporation_date >= %s AND incorporation_date <= %s",
+            "SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE shortlisted = TRUE) AS shortlisted "
+            "FROM screened_companies WHERE incorporation_date >= %s AND incorporation_date <= %s",
             (start_date.isoformat(), end_date.isoformat()),
         ).fetchone()
         status = connection.execute(
-            "SELECT MAX(received_at) AS last_received, "
-            "MAX(published_at) AS last_published, COUNT(*) AS all_time_total "
-            "FROM screened_companies"
+            "SELECT MAX(received_at) AS last_received, MAX(published_at) AS last_published, "
+            "COUNT(*) AS all_time_total FROM screened_companies"
         ).fetchone()
     return counts, status
 
 
 def update_changed_shortlist(database_url, previous_history, edited_history):
-    previous = ensure_shortlist_column(previous_history).set_index(
-        "Company number"
-    )["Shortlist"]
-    current = ensure_shortlist_column(edited_history).set_index(
-        "Company number"
-    )["Shortlist"]
+    previous = ensure_shortlist_column(previous_history).set_index("Company number")["Shortlist"]
+    current = ensure_shortlist_column(edited_history).set_index("Company number")["Shortlist"]
     previous = previous.reindex(current.index).fillna(False).astype(bool)
     current = current.fillna(False).astype(bool)
     changed_numbers = current.index[previous.ne(current)]
@@ -333,8 +348,7 @@ def update_changed_shortlist(database_url, previous_history, edited_history):
     updates = [(bool(current.loc[number]), number) for number in changed_numbers]
     with get_connection(database_url) as connection:
         connection.executemany(
-            "UPDATE screened_companies SET shortlisted = %s "
-            "WHERE company_number = %s",
+            "UPDATE screened_companies SET shortlisted = %s WHERE company_number = %s",
             updates,
         )
         connection.commit()
@@ -342,16 +356,12 @@ def update_changed_shortlist(database_url, previous_history, edited_history):
 
 def get_shortlist(database_url, start_date, end_date):
     query = (
-        "SELECT company_name AS \"Company name\", "
-        "company_number AS \"Company number\", "
-        "incorporation_date AS \"Incorporation date\", "
-        "company_status AS \"Status\", sic_codes AS \"SIC codes\", "
-        "company_url AS \"Companies House page\", "
-        "received_at AS \"Received by worker\", "
-        "published_at AS \"Published by Companies House\" "
-        "FROM screened_companies WHERE incorporation_date >= %s "
-        "AND incorporation_date <= %s AND shortlisted = TRUE "
-        "ORDER BY received_at DESC"
+        "SELECT company_name AS \"Company name\", company_number AS \"Company number\", "
+        "incorporation_date AS \"Incorporation date\", company_status AS \"Status\", "
+        "sic_codes AS \"SIC codes\", company_url AS \"Companies House page\", "
+        "received_at AS \"Received by worker\", published_at AS \"Published by Companies House\" "
+        "FROM screened_companies WHERE incorporation_date >= %s AND incorporation_date <= %s "
+        "AND shortlisted = TRUE ORDER BY received_at DESC"
     )
     with get_connection(database_url) as connection:
         return dataframe_from_query(
@@ -383,7 +393,20 @@ except ValueError:
     st.stop()
 
 start_worker_once(database_url, api_key, start_date_secret, test_all_sic_codes)
-st_autorefresh(interval=REFRESH_INTERVAL_MS, debounce=True, key="single_app_refresh")
+
+with st.sidebar:
+    st.subheader("Refresh")
+    auto_refresh = st.toggle(
+        "Auto-refresh dashboard",
+        value=True,
+        help="Refresh the visible results every 15 seconds.",
+    )
+    if auto_refresh:
+        st_autorefresh(
+            interval=REFRESH_INTERVAL_MS,
+            debounce=True,
+            key="single_app_refresh",
+        )
 
 st.title("Live Companies House Screener")
 st.caption(f"Application version: {APP_VERSION}")
@@ -401,7 +424,6 @@ with st.sidebar:
             st.write(f"Database: {database_info['database_name']}")
             st.write(f"Schema: {database_info['schema_name']}")
             st.write(f"Database time: {database_info['database_time']}")
-
         if worker_info is None:
             st.warning("Worker has not written a status record yet")
         elif worker_info["status"] == "connected":
@@ -414,11 +436,21 @@ with st.sidebar:
             st.write(f"Last event received: {worker_info['last_event_at'] or 'None'}")
             if worker_info["last_error"]:
                 st.error(f"Latest worker error: {worker_info['last_error']}")
-
         if stream_info:
             with st.expander("Stream checkpoint"):
                 st.write(f"Last timepoint: {stream_info['timepoint']}")
                 st.write(f"Last checkpoint update: {stream_info['updated_at']}")
+
+with st.sidebar:
+    st.subheader("Notifications")
+    sound_enabled = st.checkbox(
+        "Play a chime for new companies",
+        value=st.session_state.get("sound_enabled", False),
+    )
+    st.session_state.sound_enabled = sound_enabled
+    if sound_enabled and st.button("Test chime"):
+        play_chime()
+        st.success("Chime played")
 
 col1, col2 = st.columns(2)
 start_date = col1.date_input("From incorporation date", value=default_start_date)
@@ -433,6 +465,19 @@ try:
 except Exception as error:
     st.error(f"Could not read Supabase: {error}")
     st.stop()
+
+current_company_count = int(status["all_time_total"] or 0)
+if "known_company_count" not in st.session_state:
+    st.session_state.known_company_count = current_company_count
+    st.session_state.new_company_detected = False
+else:
+    st.session_state.new_company_detected = current_company_count > st.session_state.known_company_count
+    if st.session_state.new_company_detected:
+        st.session_state.known_company_count = current_company_count
+
+if st.session_state.get("sound_enabled", False) and st.session_state.get("new_company_detected", False):
+    play_chime()
+    st.toast("New company received", icon="🔔")
 
 matching_count = int(counts["total"] or 0)
 shortlist_count = int(counts["shortlisted"] or 0)
@@ -449,8 +494,8 @@ with st.expander("Connection diagnostics"):
     st.write(f"Target SIC codes: {', '.join(sorted(TARGET_SIC_CODES))}")
     st.write(f"Worker start date: {start_date_secret}")
     st.caption(
-        "The stream is live-only. Changing the display date range shows "
-        "records already stored in Supabase; it does not backfill older events."
+        "The stream is live-only. Changing the display date range shows records "
+        "already stored in Supabase; it does not backfill older events."
     )
 
 if matching_count > DISPLAY_LIMIT:
@@ -478,8 +523,10 @@ edited_history = st.data_editor(
     disabled=[column for column in editor_columns if column != "Shortlist"],
     column_config={
         "Shortlist": st.column_config.CheckboxColumn(
-            "Shortlist", help="Select this company for the downloadable shortlist.",
-            default=False, pinned=True,
+            "Shortlist",
+            help="Select this company for the downloadable shortlist.",
+            default=False,
+            pinned=True,
         ),
         "Companies House page": st.column_config.LinkColumn(
             "Companies House page", display_text="Open company page"
