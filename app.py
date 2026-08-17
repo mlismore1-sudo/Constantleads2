@@ -19,10 +19,6 @@ REQUEST_TIMEOUT_SECONDS = 20
 MAX_RETRIES = 3
 
 
-# -----------------------------
-# Configuration
-# -----------------------------
-
 def env_value(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
@@ -45,36 +41,12 @@ def get_config() -> Dict[str, str]:
 
 
 @st.cache_resource
- def get_supabase(database_url: str, supabase_key: str) -> Client:
+def get_supabase(database_url: str, supabase_key: str) -> Client:
     return create_client(database_url, supabase_key)
 
 
-# -----------------------------
-# Normalisation and rating
-# -----------------------------
-
 def normalise(value: Any) -> str:
     return " ".join(str(value or "").lower().replace("-", " ").replace("_", " ").split())
-
-
-def json_text(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True)
-
-
-def get_director_residence(officer: Dict[str, Any]) -> str:
-    address = officer.get("address") or {}
-    return normalise(
-        officer.get("country_of_residence")
-        or officer.get("countryOfResidence")
-        or address.get("country")
-    )
-
-
-def get_director_nationality(officer: Dict[str, Any]) -> str:
-    return normalise(
-        officer.get("nationality")
-        or officer.get("nationality_description")
-    )
 
 
 def is_target_country(officer: Dict[str, Any]) -> bool:
@@ -86,17 +58,34 @@ def is_target_country(officer: Dict[str, Any]) -> bool:
         "syrian arab republic",
         "syria",
     }
-    residence = get_director_residence(officer)
-    nationality = get_director_nationality(officer)
+    address = officer.get("address") or {}
+    residence = normalise(
+        officer.get("country_of_residence")
+        or officer.get("countryOfResidence")
+        or address.get("country")
+    )
+    nationality = normalise(
+        officer.get("nationality")
+        or officer.get("nationality_description")
+    )
     return any(term in residence or term in nationality for term in target_terms)
 
 
 def is_us_person(officer: Dict[str, Any]) -> bool:
-    values = [
-        get_director_residence(officer),
-        get_director_nationality(officer),
-    ]
-    return any("united states" in value or value == "usa" or "american" in value for value in values)
+    address = officer.get("address") or {}
+    residence = normalise(
+        officer.get("country_of_residence")
+        or officer.get("countryOfResidence")
+        or address.get("country")
+    )
+    nationality = normalise(
+        officer.get("nationality")
+        or officer.get("nationality_description")
+    )
+    return any(
+        "united states" in value or value == "usa" or "american" in value
+        for value in (residence, nationality)
+    )
 
 
 def is_corporate_psc(psc: Dict[str, Any]) -> bool:
@@ -137,10 +126,6 @@ def calculate_star_rating(
     )
 
 
-# -----------------------------
-# Companies House requests
-# -----------------------------
-
 def companies_house_get(api_key: str, path: str) -> Dict[str, Any]:
     url = f"{COMPANIES_HOUSE_API}{path}"
     last_error: Optional[Exception] = None
@@ -173,7 +158,10 @@ def fetch_all_items(api_key: str, path: str) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     while True:
         separator = "&" if "?" in path else "?"
-        payload = companies_house_get(api_key, f"{path}{separator}items_per_page=100&start_index={page * 100}")
+        payload = companies_house_get(
+            api_key,
+            f"{path}{separator}items_per_page=100&start_index={page * 100}",
+        )
         current = payload.get("items") or []
         items.extend(current)
         if len(current) < 100:
@@ -189,7 +177,10 @@ def enrich_one_company(row: Dict[str, Any], api_key: str) -> Dict[str, Any]:
 
     officers = fetch_all_items(api_key, f"/company/{company_number}/officers")
     time.sleep(ENRICHMENT_PAUSE_SECONDS)
-    pscs = fetch_all_items(api_key, f"/company/{company_number}/persons-with-significant-control")
+    pscs = fetch_all_items(
+        api_key,
+        f"/company/{company_number}/persons-with-significant-control",
+    )
 
     corporate_names = [psc_name(item) for item in pscs if is_corporate_psc(item)]
     target_director_names = [
@@ -225,10 +216,6 @@ def enrich_one_company(row: Dict[str, Any], api_key: str) -> Dict[str, Any]:
     }
 
 
-# -----------------------------
-# Database helpers
-# -----------------------------
-
 def claim_pending_company(client: Client) -> Optional[Dict[str, Any]]:
     result = (
         client.table("screened_companies")
@@ -256,10 +243,6 @@ def update_enrichment(client: Client, company_number: str, values: Dict[str, Any
         "company_number", company_number
     ).execute()
 
-
-# -----------------------------
-# Background enrichment worker
-# -----------------------------
 
 def enrichment_worker(database_url: str, supabase_key: str, api_key: str) -> None:
     client = create_client(database_url, supabase_key)
@@ -289,22 +272,14 @@ def enrichment_worker(database_url: str, supabase_key: str, api_key: str) -> Non
             time.sleep(5)
 
 
-# -----------------------------
-# Optional stream worker hook
-# -----------------------------
-
 def stream_worker(database_url: str, supabase_key: str, api_key: str) -> None:
-    """Replace this body with the existing Companies House streaming ingestion code.
-
-    The stream worker should insert matching companies with enrichment_status='pending'.
-    The enrichment worker above then processes those rows independently.
-    """
+    """Replace this placeholder with the existing stream-ingestion code."""
     while True:
         time.sleep(10)
 
 
 @st.cache_resource
- def start_workers_once(database_url: str, supabase_key: str, api_key: str):
+def start_workers_once(database_url: str, supabase_key: str, api_key: str):
     stream_thread = threading.Thread(
         target=stream_worker,
         args=(database_url, supabase_key, api_key),
@@ -321,10 +296,6 @@ def stream_worker(database_url: str, supabase_key: str, api_key: str) -> None:
     enrichment_thread.start()
     return stream_thread, enrichment_thread
 
-
-# -----------------------------
-# Dashboard
-# -----------------------------
 
 def display_rating(row: pd.Series) -> str:
     status = row.get("enrichment_status")
