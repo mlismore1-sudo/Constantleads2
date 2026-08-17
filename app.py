@@ -1,20 +1,21 @@
-"""Constant Leads - pre-enrichment dashboard.
+"""Constant Leads - pre-enrichment dashboard using a direct PostgreSQL connection.
 
-This is the rollback version. It does not start an enrichment worker and does
-not require COMPANIES_HOUSE_API_KEY or SUPABASE_SERVICE_ROLE_KEY.
+This version does not use the Supabase API client and does not require
+SUPABASE_URL, SUPABASE_KEY, SUPABASE_SERVICE_ROLE_KEY, or
+COMPANIES_HOUSE_API_KEY.
 """
 
 import os
 from typing import Any, Dict
 
 import pandas as pd
+import psycopg
 import streamlit as st
-from supabase import Client, create_client
 
 
 @st.cache_resource
-def get_supabase(url: str, key: str) -> Client:
-    return create_client(url, key)
+def get_database_connection(database_url: str):
+    return psycopg.connect(database_url, connect_timeout=15)
 
 
 def read_secret(name: str) -> str:
@@ -25,36 +26,34 @@ def read_secret(name: str) -> str:
     return str(value or os.getenv(name, "")).strip()
 
 
-def read_config() -> Dict[str, str]:
-    supabase_url = read_secret("SUPABASE_URL")
-    supabase_key = (
-        read_secret("SUPABASE_KEY")
-        or read_secret("SUPABASE_ANON_KEY")
-        or read_secret("SUPABASE_SERVICE_ROLE_KEY")
-    )
+def get_database_url() -> str:
+    database_url = read_secret("DATABASE_URL")
 
-    if not supabase_url or not supabase_key:
+    if not database_url:
         st.error(
-            "Missing Supabase configuration. Add SUPABASE_URL and SUPABASE_KEY "
-            "to Streamlit app Settings → Secrets."
+            "Missing database configuration. Add DATABASE_URL to Streamlit "
+            "app Settings → Secrets."
         )
         st.stop()
 
-    return {
-        "supabase_url": supabase_url,
-        "supabase_key": supabase_key,
-    }
+    return database_url
 
 
-def load_companies(client: Client) -> pd.DataFrame:
-    response = (
-        client.table("screened_companies")
-        .select("*")
-        .order("received_at", desc=True)
-        .limit(500)
-        .execute()
-    )
-    return pd.DataFrame(response.data or [])
+def load_companies(database_url: str) -> pd.DataFrame:
+    query = """
+        SELECT *
+        FROM public.screened_companies
+        ORDER BY received_at DESC NULLS LAST
+        LIMIT 500
+    """
+
+    with psycopg.connect(database_url, connect_timeout=15) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            column_names = [description.name for description in cursor.description]
+
+    return pd.DataFrame(rows, columns=column_names)
 
 
 def format_value(value: Any) -> Any:
@@ -73,16 +72,16 @@ def main() -> None:
     st.title("Constant Leads")
     st.caption("Pre-enrichment lead dashboard")
 
-    config = read_config()
-    client = get_supabase(
-        config["supabase_url"],
-        config["supabase_key"],
-    )
+    database_url = get_database_url()
 
     try:
-        companies = load_companies(client)
+        companies = load_companies(database_url)
     except Exception as exc:
-        st.error(f"Could not read screened_companies from Supabase: {exc}")
+        st.error(f"Could not connect to Supabase PostgreSQL: {exc}")
+        st.info(
+            "Check that DATABASE_URL is copied from Supabase → Connect → "
+            "Session pooler or Direct connection."
+        )
         st.stop()
 
     if companies.empty:
