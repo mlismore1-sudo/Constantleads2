@@ -17,22 +17,18 @@ import streamlit as st
 from psycopg.rows import dict_row
 from streamlit_autorefresh import st_autorefresh
 
-APP_VERSION = "2026-08-17-enriched-all-in-one"
+APP_VERSION = "2026-08-17-enriched-primary-columns"
 STREAM_URL = "https://stream.companieshouse.gov.uk/companies"
 DISPLAY_LIMIT = 250
 REFRESH_INTERVAL_MS = 15000
 ENRICHMENT_PAUSE_SECONDS = 0.55
 UK_TIMEZONE = ZoneInfo("Europe/London")
-TARGET_SIC_CODES = {
-    "62012", "63110", "64209", "64301", "64999", "72110"
-}
+TARGET_SIC_CODES = {"62012", "63110", "64209", "64301", "64999", "72110"}
 TARGET_NAME_KEYWORDS = {
     "labs", "global", "holdings", "capital", "ai", "technology",
     "technologies", "uk", "london", "europe", "inc", "pty", "pvt", "group",
 }
-EXCLUDED_DIRECTOR_COUNTRIES = {
-    "pakistan", "turkey", "nigeria", "china",
-}
+EXCLUDED_DIRECTOR_COUNTRIES = {"pakistan", "turkey", "nigeria", "china"}
 TARGET_DIRECTOR_COUNTRIES = {
     "austria", "belgium", "bulgaria", "croatia", "cyprus", "czech republic",
     "czechia", "denmark", "estonia", "finland", "france", "germany", "greece",
@@ -45,12 +41,7 @@ US_COUNTRIES = {"united states", "usa", "united states of america"}
 
 
 def get_connection(database_url):
-    return psycopg.connect(
-        database_url,
-        row_factory=dict_row,
-        connect_timeout=30,
-        sslmode="require",
-    )
+    return psycopg.connect(database_url, row_factory=dict_row, connect_timeout=30, sslmode="require")
 
 
 def today_in_uk():
@@ -63,40 +54,27 @@ def normalise(value):
 
 def name_matches_target_keywords(company_name):
     name = normalise(company_name)
-    return any(
-        re.search(rf"(?<![a-z]){re.escape(keyword)}(?![a-z])", name)
-        for keyword in TARGET_NAME_KEYWORDS
-    )
+    return any(re.search(rf"(?<![a-z]){re.escape(keyword)}(?![a-z])", name) for keyword in TARGET_NAME_KEYWORDS)
 
 
 def country_value(record, *keys):
     for key in keys:
-        value = record.get(key)
-        if value:
-            return normalise(value)
+        if record.get(key):
+            return normalise(record[key])
     address = record.get("address") or {}
-    return normalise(
-        address.get("country")
-        or address.get("country_of_residence")
-        or address.get("countryOfResidence")
-    )
+    return normalise(address.get("country") or address.get("country_of_residence") or address.get("countryOfResidence"))
 
 
 def is_active_director(officer):
     ceased = officer.get("ceased_on") or officer.get("ceasedOn")
-    officer_role = normalise(officer.get("officer_role") or officer.get("officerRole"))
-    return not ceased and (not officer_role or "director" in officer_role)
+    role = normalise(officer.get("officer_role") or officer.get("officerRole"))
+    return not ceased and (not role or "director" in role)
 
 
 def is_corporate_psc(psc):
     kind = normalise(psc.get("kind"))
-    return "corporate" in kind or "legal-person" in kind or bool(
-        psc.get("identification", {}).get("legal_form")
-    )
-
-
-def calculate_star_rating(buzzword_match, sic_match, corporate_psc, target_country, us_bonus):
-    return int(buzzword_match) + int(sic_match) + int(corporate_psc) + int(target_country) + int(us_bonus)
+    identification = psc.get("identification") or {}
+    return "corporate" in kind or "legal-person" in kind or bool(identification.get("legal_form"))
 
 
 def create_chime():
@@ -108,10 +86,7 @@ def create_chime():
         frequency = 880 if current_time < 0.16 else 1175
         attack = min(1.0, index / 800)
         release = max(0.0, 1.0 - max(0.0, current_time - 0.20) / 0.15)
-        sample = int(
-            32767 * 0.25 * attack * release
-            * math.sin(2 * math.pi * frequency * current_time)
-        )
+        sample = int(32767 * 0.25 * attack * release * math.sin(2 * math.pi * frequency * current_time))
         frames.extend(sample.to_bytes(2, byteorder="little", signed=True))
     buffer = io.BytesIO()
     with wave.open(buffer, "wb") as audio:
@@ -129,10 +104,7 @@ def cached_chime():
 
 def play_chime():
     encoded = base64.b64encode(cached_chime()).decode("ascii")
-    st.markdown(
-        f'<audio autoplay><source src="data:audio/wav;base64,{encoded}" type="audio/wav"></audio>',
-        unsafe_allow_html=True,
-    )
+    st.markdown(f'<audio autoplay><source src="data:audio/wav;base64,{encoded}" type="audio/wav"></audio>', unsafe_allow_html=True)
 
 
 def dataframe_from_query(connection, query, params=()):
@@ -165,24 +137,13 @@ def add_google_search_links(dataframe):
 
 
 def ensure_worker_status_table(connection):
-    connection.execute(
-        "CREATE TABLE IF NOT EXISTS public.worker_status ("
-        "id INTEGER PRIMARY KEY CHECK (id = 1), status TEXT NOT NULL, "
-        "last_connected_at TIMESTAMPTZ, last_event_at TIMESTAMPTZ, "
-        "last_error TEXT, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
-    )
+    connection.execute("CREATE TABLE IF NOT EXISTS public.worker_status (id INTEGER PRIMARY KEY CHECK (id = 1), status TEXT NOT NULL, last_connected_at TIMESTAMPTZ, last_event_at TIMESTAMPTZ, last_error TEXT, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")
     connection.commit()
 
 
 def update_worker_status(connection, status, error=None, event_received=False):
     connection.execute(
-        "INSERT INTO public.worker_status (id, status, last_connected_at, last_event_at, last_error, updated_at) "
-        "VALUES (1, %s, CASE WHEN %s = 'connected' THEN NOW() ELSE NULL END, "
-        "CASE WHEN %s THEN NOW() ELSE NULL END, %s, NOW()) "
-        "ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, "
-        "last_connected_at = CASE WHEN EXCLUDED.status = 'connected' THEN NOW() ELSE public.worker_status.last_connected_at END, "
-        "last_event_at = CASE WHEN %s THEN NOW() ELSE public.worker_status.last_event_at END, "
-        "last_error = EXCLUDED.last_error, updated_at = NOW()",
+        "INSERT INTO public.worker_status (id, status, last_connected_at, last_event_at, last_error, updated_at) VALUES (1, %s, CASE WHEN %s = 'connected' THEN NOW() ELSE NULL END, CASE WHEN %s THEN NOW() ELSE NULL END, %s, NOW()) ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, last_connected_at = CASE WHEN EXCLUDED.status = 'connected' THEN NOW() ELSE public.worker_status.last_connected_at END, last_event_at = CASE WHEN %s THEN NOW() ELSE public.worker_status.last_event_at END, last_error = EXCLUDED.last_error, updated_at = NOW()",
         (status, status, event_received, error, event_received),
     )
 
@@ -195,15 +156,9 @@ def table_exists(connection, table_name):
 def check_database_connection(database_url):
     try:
         with get_connection(database_url) as connection:
-            info = connection.execute(
-                "SELECT current_database() AS database_name, current_schema() AS schema_name, NOW() AS database_time"
-            ).fetchone()
-            stream = connection.execute(
-                "SELECT timepoint, updated_at FROM public.stream_state WHERE id = 1"
-            ).fetchone() if table_exists(connection, "stream_state") else None
-            worker = connection.execute(
-                "SELECT status, last_connected_at, last_event_at, last_error, updated_at FROM public.worker_status WHERE id = 1"
-            ).fetchone() if table_exists(connection, "worker_status") else None
+            info = connection.execute("SELECT current_database() AS database_name, current_schema() AS schema_name, NOW() AS database_time").fetchone()
+            stream = connection.execute("SELECT timepoint, updated_at FROM public.stream_state WHERE id = 1").fetchone() if table_exists(connection, "stream_state") else None
+            worker = connection.execute("SELECT status, last_connected_at, last_event_at, last_error, updated_at FROM public.worker_status WHERE id = 1").fetchone() if table_exists(connection, "worker_status") else None
         return True, info, stream, worker, None
     except Exception as error:
         return False, None, None, None, f"{type(error).__name__}: {error}"
@@ -221,11 +176,7 @@ def extract_metadata(event):
 
 def save_timepoint(connection, timepoint):
     if timepoint is not None:
-        connection.execute(
-            "INSERT INTO public.stream_state (id, timepoint, updated_at) VALUES (1, %s, NOW()) "
-            "ON CONFLICT (id) DO UPDATE SET timepoint = EXCLUDED.timepoint, updated_at = NOW()",
-            (int(timepoint),),
-        )
+        connection.execute("INSERT INTO public.stream_state (id, timepoint, updated_at) VALUES (1, %s, NOW()) ON CONFLICT (id) DO UPDATE SET timepoint = EXCLUDED.timepoint, updated_at = NOW()", (int(timepoint),))
 
 
 def save_matching_company(connection, company, published_at, received_at, test_all_sic_codes):
@@ -235,17 +186,13 @@ def save_matching_company(connection, company, published_at, received_at, test_a
     sic_codes = {str(code).strip() for code in (company.get("sic_codes") or [])}
     if not company_number or incorporation_date != today_in_uk():
         return False
-
     sic_match = bool(sic_codes.intersection(TARGET_SIC_CODES))
     buzzword_match = name_matches_target_keywords(company_name)
     if not test_all_sic_codes and not (sic_match or buzzword_match):
         return False
-
     company_url = f"https://find-and-update.company-information.service.gov.uk/company/{company_number}"
     connection.execute(
-        "INSERT INTO public.screened_companies (company_number, company_name, incorporation_date, company_status, sic_codes, company_url, screened_at, shortlisted, published_at, received_at, buzzword_match, sic_match, enrichment_status) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE, %s, %s, %s, %s, 'pending') "
-        "ON CONFLICT (company_number) DO UPDATE SET company_name = EXCLUDED.company_name, incorporation_date = EXCLUDED.incorporation_date, company_status = EXCLUDED.company_status, sic_codes = EXCLUDED.sic_codes, company_url = EXCLUDED.company_url, published_at = COALESCE(EXCLUDED.published_at, public.screened_companies.published_at), received_at = EXCLUDED.received_at, buzzword_match = EXCLUDED.buzzword_match, sic_match = EXCLUDED.sic_match, enrichment_status = CASE WHEN public.screened_companies.enrichment_status = 'complete' THEN public.screened_companies.enrichment_status ELSE 'pending' END",
+        "INSERT INTO public.screened_companies (company_number, company_name, incorporation_date, company_status, sic_codes, company_url, screened_at, shortlisted, published_at, received_at, buzzword_match, sic_match, enrichment_status) VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE, %s, %s, %s, %s, 'pending') ON CONFLICT (company_number) DO UPDATE SET company_name = EXCLUDED.company_name, incorporation_date = EXCLUDED.incorporation_date, company_status = EXCLUDED.company_status, sic_codes = EXCLUDED.sic_codes, company_url = EXCLUDED.company_url, published_at = COALESCE(EXCLUDED.published_at, public.screened_companies.published_at), received_at = EXCLUDED.received_at, buzzword_match = EXCLUDED.buzzword_match, sic_match = EXCLUDED.sic_match, enrichment_status = CASE WHEN public.screened_companies.enrichment_status = 'complete' THEN public.screened_companies.enrichment_status ELSE 'pending' END",
         (company_number, company_name, incorporation_date, company.get("company_status", ""), ", ".join(sorted(sic_codes)), company_url, received_at, published_at, received_at, buzzword_match, sic_match),
     )
     return True
@@ -259,7 +206,6 @@ def stream_worker(database_url, api_key, test_all_sic_codes):
     session.auth = (api_key, "")
     session.headers.update({"Accept": "application/json"})
     print(f"Worker starting. Mode={'ALL SIC' if test_all_sic_codes else 'SIC OR NAME'}. UK date={today_in_uk()}", flush=True)
-
     while True:
         connection = None
         try:
@@ -318,7 +264,6 @@ def enrich_one_company(database_url, api_key, row):
     session = requests.Session()
     officers = fetch_json(session, api_key, f"{base_url}/officers").get("items", [])
     pscs = fetch_json(session, api_key, f"{base_url}/persons-with-significant-control").get("items", [])
-
     directors = [item for item in officers if is_active_director(item)]
     excluded = []
     target_directors = []
@@ -332,18 +277,10 @@ def enrich_one_company(database_url, api_key, row):
             target_directors.append(director.get("name", "Unnamed director"))
             if residence in US_COUNTRIES and nationality in US_COUNTRIES:
                 us_bonus = True
-
-    corporate_names = [
-        item.get("name", "Unnamed corporate PSC")
-        for item in pscs
-        if is_corporate_psc(item)
-    ]
+    corporate_names = [item.get("name", "Unnamed corporate PSC") for item in pscs if is_corporate_psc(item)]
     corporate_psc = bool(corporate_names)
     target_country = bool(target_directors)
-    buzzword = bool(row.get("buzzword_match"))
-    sic_match = bool(row.get("sic_match"))
-    stars = calculate_star_rating(buzzword, sic_match, corporate_psc, target_country, us_bonus)
-
+    stars = int(bool(row.get("buzzword_match"))) + int(bool(row.get("sic_match"))) + int(corporate_psc) + int(target_country) + int(us_bonus)
     with get_connection(database_url) as connection:
         connection.execute(
             "UPDATE public.screened_companies SET corporate_psc = %s, corporate_psc_names = %s, director_count = %s, excluded_director_country = %s, excluded_director_names = %s, target_country_director = %s, target_country_director_names = %s, us_person_bonus = %s, star_rating = %s, enrichment_status = %s, enriched_at = NOW() WHERE company_number = %s",
@@ -356,18 +293,13 @@ def enrichment_worker(database_url, api_key):
     while True:
         try:
             with get_connection(database_url) as connection:
-                row = connection.execute(
-                    "SELECT * FROM public.screened_companies WHERE enrichment_status = 'pending' AND incorporation_date = (NOW() AT TIME ZONE 'Europe/London')::date ORDER BY received_at ASC LIMIT 1"
-                ).fetchone()
+                row = connection.execute("SELECT * FROM public.screened_companies WHERE enrichment_status = 'pending' AND incorporation_date = (NOW() AT TIME ZONE 'Europe/London')::date ORDER BY received_at ASC LIMIT 1").fetchone()
             if row:
                 try:
                     enrich_one_company(database_url, api_key, row)
                 except Exception as error:
                     with get_connection(database_url) as connection:
-                        connection.execute(
-                            "UPDATE public.screened_companies SET enrichment_status = 'error', enriched_at = NOW() WHERE company_number = %s",
-                            (row["company_number"],),
-                        )
+                        connection.execute("UPDATE public.screened_companies SET enrichment_status = 'error', enriched_at = NOW() WHERE company_number = %s", (row["company_number"],))
                         connection.commit()
                     print(f"Enrichment failed for {row['company_number']}: {error}", flush=True)
                 time.sleep(ENRICHMENT_PAUSE_SECONDS)
@@ -405,17 +337,12 @@ def update_changed_shortlist(database_url, previous_history, edited_history):
     if len(changed) == 0:
         return
     with get_connection(database_url) as connection:
-        connection.executemany(
-            "UPDATE public.screened_companies SET shortlisted = %s WHERE company_number = %s",
-            [(bool(current.loc[number]), number) for number in changed],
-        )
+        connection.executemany("UPDATE public.screened_companies SET shortlisted = %s WHERE company_number = %s", [(bool(current.loc[number]), number) for number in changed])
         connection.commit()
 
 
 def get_shortlist(database_url):
-    query = (
-        "SELECT company_name AS \"Company name\", company_number AS \"Company number\", incorporation_date AS \"Incorporation date\", company_status AS \"Status\", sic_codes AS \"SIC codes\", company_url AS \"Companies House page\", received_at AS \"Received by worker\", published_at AS \"Published by Companies House\", corporate_psc AS \"Corporate PSC\", corporate_psc_names AS \"Corporate PSC names\", director_count AS \"Director count\", target_country_director AS \"Target-country director\", target_country_director_names AS \"Target-country director names\", us_person_bonus AS \"US person bonus\", star_rating AS \"Stars\" FROM public.screened_companies WHERE incorporation_date = (NOW() AT TIME ZONE 'Europe/London')::date AND shortlisted = TRUE AND excluded_director_country = FALSE ORDER BY published_at DESC NULLS LAST, received_at DESC NULLS LAST, company_number DESC"
-    )
+    query = "SELECT company_name AS \"Company name\", company_number AS \"Company number\", incorporation_date AS \"Incorporation date\", company_status AS \"Status\", sic_codes AS \"SIC codes\", company_url AS \"Companies House page\", received_at AS \"Received by worker\", published_at AS \"Published by Companies House\", corporate_psc AS \"Corporate PSC\", corporate_psc_names AS \"Corporate PSC names\", director_count AS \"Director count\", target_country_director AS \"Target-country director\", target_country_director_names AS \"Target-country director names\", us_person_bonus AS \"US person bonus\", star_rating AS \"Stars\" FROM public.screened_companies WHERE incorporation_date = (NOW() AT TIME ZONE 'Europe/London')::date AND shortlisted = TRUE AND excluded_director_country = FALSE ORDER BY published_at DESC NULLS LAST, received_at DESC NULLS LAST, company_number DESC"
     with get_connection(database_url) as connection:
         shortlist = dataframe_from_query(connection, query)
     return add_google_search_links(shortlist)
@@ -432,8 +359,8 @@ database_url = st.secrets["DATABASE_URL"]
 api_key = st.secrets["COMPANIES_HOUSE_STREAMING_API_KEY"]
 test_all_sic_codes = str(st.secrets.get("TEST_ALL_SIC_CODES", "false")).lower() == "true"
 start_workers_once(database_url, api_key, test_all_sic_codes)
-
 st_autorefresh(interval=REFRESH_INTERVAL_MS, debounce=True, key="dashboard_refresh")
+
 st.title("Live Companies House Screener")
 st.caption(f"Application version: {APP_VERSION}")
 st.caption("New matching companies are enriched in the background without blocking the stream.")
@@ -466,18 +393,9 @@ with st.sidebar:
 
 try:
     history = get_history(database_url)
-    status_row = get_connection(database_url).execute("SELECT COUNT(*) AS total FROM public.screened_companies WHERE incorporation_date = (NOW() AT TIME ZONE 'Europe/London')::date").fetchone()
 except Exception as error:
     st.error(f"Could not read Supabase: {error}")
     st.stop()
-
-current_count = int(status_row["total"] or 0)
-previous_count = st.session_state.get("known_company_count", current_count)
-new_company = current_count > previous_count
-st.session_state.known_company_count = current_count
-if sound_enabled and new_company:
-    play_chime()
-    st.toast("New company received", icon="🔔")
 
 st.metric("Today's visible companies", len(history))
 with st.expander("Rating rules"):
@@ -489,7 +407,7 @@ if history.empty:
     st.stop()
 
 editor_columns = [
-    "Shortlist", "Stars", "Company name", "Company number", "Incorporation date", "Status", "SIC codes", "Corporate PSC", "Corporate PSC names", "Director count", "Target-country director", "Target-country director names", "US person bonus", "Enrichment status", "Companies House page", "Google search", "Received by worker", "Published by Companies House",
+    "Shortlist", "Company name", "Stars", "SIC codes", "Companies House page", "Google search", "Company number", "Incorporation date", "Status", "Corporate PSC", "Corporate PSC names", "Director count", "Target-country director", "Target-country director names", "US person bonus", "Enrichment status", "Received by worker", "Published by Companies House",
 ]
 editable = ensure_shortlist_column(history[editor_columns])
 edited = st.data_editor(
@@ -500,9 +418,11 @@ edited = st.data_editor(
     disabled=[column for column in editor_columns if column != "Shortlist"],
     column_config={
         "Shortlist": st.column_config.CheckboxColumn("Shortlist", default=False, pinned=True),
+        "Company name": st.column_config.TextColumn("Company Name"),
+        "Stars": st.column_config.NumberColumn("Rating", min_value=0, max_value=5, format="%d ⭐"),
+        "SIC codes": st.column_config.TextColumn("SIC"),
         "Companies House page": st.column_config.LinkColumn("Companies House page", display_text="Open company page"),
         "Google search": st.column_config.LinkColumn("Google search", display_text="Search Google"),
-        "Stars": st.column_config.NumberColumn("Stars", min_value=0, max_value=5, format="%d ⭐"),
     },
 )
 update_changed_shortlist(database_url, editable, edited)
@@ -510,8 +430,8 @@ update_changed_shortlist(database_url, editable, edited)
 shortlist = get_shortlist(database_url)
 st.subheader("Today's shortlist")
 st.write(f"{len(shortlist)} company(ies) selected today.")
-if not shortlist.empty:
+if shortlist.empty:
+    st.info("Select companies above to create a shortlist.")
+else:
     st.download_button("Download today's shortlist as CSV", data=shortlist.to_csv(index=False).encode("utf-8"), file_name="companies_house_shortlist.csv", mime="text/csv", type="primary")
     st.dataframe(shortlist, use_container_width=True, hide_index=True)
-else:
-    st.info("Select companies above to create a shortlist.")
